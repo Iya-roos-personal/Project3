@@ -1,319 +1,345 @@
-# Project 3 — CDC + Orchestrated Lakehouse Pipeline
+# Project 3 — CDC & Orchestrated Lakehouse Pipeline
 
-Build a CDC pipeline that captures changes from a PostgreSQL database using Debezium,
-lands them in an Apache Iceberg lakehouse (bronze → silver), **and** continues the
-streaming taxi pipeline from Project 2 — now orchestrated end-to-end with Apache Airflow.
+.env values are the same as .env.example (just to simplfy running project).
 
-Your group's custom scenario is (or will be :-)) described in your repository's GitHub issue.
+## 1. CDC Correctness
+
+### Silver Mirrors PostgreSQL
+
+The validation task compares PostgreSQL tables with Silver Iceberg tables.
+
+![alt text](image-6.png)
+
+Spot-check validation:
+
+* customers IDs: 1, 2, 3 → Match
+* drivers IDs: 1, 3, 5 → Match
+
+![alt text](image-4.png)
+
+Validation output:
+
+```
+customers: postgres=50, silver=50
+customers: spot-check passed for id=1
+customers: spot-check passed for id=2
+customers: spot-check passed for id=3
+drivers: postgres=28, silver=28
+drivers: spot-check passed for id=1
+drivers: spot-check passed for id=3
+drivers: spot-check passed for id=5
+Validation passed: Silver CDC matches PostgreSQL counts and sampled rows.
+```
+
+### Delete Propagation
+
+Deletes are captured by Debezium as `op='d'`.
+During the Silver MERGE step:
+
+* `op='d'` → row is removed from Silver
+
+Observed behavior:
+
+* Deleted rows in PostgreSQL no longer appear in Silver
+* Row counts decrease accordingly
+
+Inserting new row.
+![alt text](image-1.png)
+![alt text](image-2.png)
+Deleting row and it no longer appears in Silver.
+![alt text](image-3.png)
+![alt text](image-5.png)
+
+### Idempotency
+
+The DAG was run multiple times with no new input data:
+
+* Row counts remained unchanged
+* No duplicate rows were created
+
+This is guaranteed because:
+
+* Bronze ingestion deduplicates Kafka offsets
+* Silver uses deterministic `ROW_NUMBER()` logic
+* MERGE operations produce the same result on re-run
+
+![alt text](image-7.png)
+![alt text](image-8.png)
+![alt text](image-9.png)
 
 ---
 
-## What's in this template
+## 2. Lakehouse Design
 
-| Path | Description |
-|------|-------------|
-| `compose.yml` | Kafka, MinIO, Iceberg REST catalog, PostgreSQL, Kafka Connect (Debezium), Airflow, Jupyter/PySpark |
-| `produce.py` | Replays taxi parquet rows as JSON into the `taxi-trips` Kafka topic (same as Project 2) |
-| `seed.py` | Creates source tables in PostgreSQL and inserts initial data |
-| `simulate.py` | Continuously makes changes (INSERT, UPDATE, DELETE) to PostgreSQL, simulating a live OLTP workload |
-| `dags/` | Place your Airflow DAG file(s) here — auto-loaded by the Airflow scheduler |
-| `REPORT.md` | Template for the report you need to hand in |
-| `.env.example` | Template for credentials — copy to `.env` and fill in values |
-| `data/` | **Not in git.** Place the same taxi parquet files from Project 1 & 2 here |
+### Bronze CDC
 
-The `data/` directory is git-ignored. You will use the same files as in previous projects:
+Tables:
 
-| File | Description |
-|------|-------------|
-| `data/yellow_tripdata_2025-01.parquet` | NYC Yellow Taxi trips — January 2025 |
-| `data/yellow_tripdata_2025-02.parquet` | NYC Yellow Taxi trips — February 2025 |
-| `data/taxi_zone_lookup.parquet` | Pickup/dropoff zone names |
+* `demo.bronze.customers_cdc`
+* `demo.bronze.drivers_cdc`
 
----
+Schema includes:
 
-## Setup
+* Kafka metadata (partition, offset, timestamp)
+* CDC metadata (`op`, `lsn`, `event_ts_ms`)
+* Raw JSON (`before_json`, `after_json`)
 
-### 1. Configure credentials
+Purpose:
 
-```bash
-cp .env.example .env
-# Edit .env — change all default passwords before starting the stack
-```
+* Immutable event log
+* Stores every change event
+* Supports replay and auditing
 
-The `.env` file is git-ignored and never committed.
-You need to change all the default secrets, and provide them in `REPORT.md` section 8 in your project submission.
-
-### 2. Place the data files
-
-Same taxi data as Project 2:
-
-```
-project_3/
-└── data/
-    ├── yellow_tripdata_2025-01.parquet
-    ├── yellow_tripdata_2025-02.parquet
-    └── taxi_zone_lookup.parquet
-```
-
-### 3. Start the stack
-
-```bash
-docker compose up -d
-```
-
-Allow ~30 seconds for all services to become ready. PostgreSQL, Kafka, Kafka Connect,
-MinIO, Iceberg catalog, Airflow, and Jupyter all need to start in order.
-
-### 4. Verify services
-
-```bash
-docker ps
-```
-
-You should see these services running:
-
-| Container | Role |
-|-----------|------|
-| `kafka` | Message broker (KRaft, no ZooKeeper) |
-| `postgres` | OLTP source database for CDC |
-| `connect` | Kafka Connect with Debezium PostgreSQL connector |
-| `minio` | S3-compatible object storage for Iceberg |
-| `minio_init` | One-shot bucket creation (exited is OK) |
-| `iceberg-rest` | Iceberg REST catalog |
-| `airflow-webserver` | Airflow UI |
-| `airflow-scheduler` | Airflow DAG scheduler |
-| `jupyter` | Jupyter + PySpark |
-
-### 5. Seed the PostgreSQL source
-
-```bash
-docker exec jupyter python /home/jovyan/project/seed.py
-```
-
-This creates the source tables and inserts initial data. Verify in the Jupyter notebook:
-
-```python
-pg_execute("SELECT * FROM customers ORDER BY id;", fetch=True)
-```
-
-### 6. Start the taxi producer (same as Project 2)
-
-```bash
-docker exec jupyter python /home/jovyan/project/produce.py --loop
-```
-
-### 7. Start the change simulator
-
-```bash
-docker exec jupyter python /home/jovyan/project/simulate.py
-```
-
-This continuously makes random inserts, updates, and deletes to the PostgreSQL
-source tables, simulating a live application.
-
-### 8. Open services
-
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| Jupyter | http://localhost:8888 | token: `JUPYTER_TOKEN` from `.env` |
-| Airflow | http://localhost:8080 | `AIRFLOW_USER` / `AIRFLOW_PASSWORD` from `.env` |
-| Spark UI | http://localhost:4040 | — |
-| MinIO Console | http://localhost:9001 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` from `.env` |
-| Kafka Connect API | http://localhost:8083 | — |
-| Iceberg REST API | http://localhost:8181/v1/namespaces | — |
-
-### 9. Stop the stack
-
-```bash
-docker compose down          # keeps MinIO data (named volume)
-docker compose down -v       # also deletes stored Iceberg tables
-```
+![alt text](image-10.png)
+![alt text](image-11.png)
 
 ---
 
-## What to build
+### Silver CDC
 
-Your pipeline has **two data paths**, both orchestrated by a single Airflow DAG:
+Tables:
+
+* `demo.silver.customers`
+* `demo.silver.drivers`
+
+Contains:
+
+* Cleaned, typed columns
+* CDC metadata fields for traceability
+
+Difference from Bronze:
+
+* Only latest record per primary key
+* Represents current state of PostgreSQL
+
+![alt text](image-12.png)
+![alt text](image-13.png)
+
+---
+
+### Bronze Taxi
+
+Table:
+
+* `demo.bronze.stg_taxi`
+
+Stores:
+
+* Raw Kafka events
+* JSON payload
+* Kafka offsets
+
+![alt text](image-14.png)
+
+---
+
+### Silver Taxi
+
+Table:
+
+* `demo.silver.fct_taxi_trip`
+
+Transforms:
+
+* Parses timestamps
+* Casts numeric fields
+* Removes invalid trips
+* Enriches with zone names
+
+![alt text](image-15.png)
+
+---
+
+### Gold Taxi
+
+Tables:
+
+* `demo.gold.analytical_taxi_trips`
+* `demo.gold.taxi_zone_hourly_metrics`
+
+Aggregates:
+
+* Trip count
+* Average fare
+* Average duration
+* Metrics grouped by pickup zone and hour
+
+![alt text](image-16.png)
+![alt text](image-17.png)
+
+---
+
+### Iceberg Snapshot History
+
+Query:
+
+```sql
+SELECT * 
+FROM demo.silver.customers.snapshots
+ORDER BY committed_at DESC;
+```
+
+================================================================================
+demo.silver.customers.snapshots
++-----------------------+-------------------+-------------------+---------+-------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+|committed_at           |snapshot_id        |parent_id          |operation|manifest_list                                                                                                |summary                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
++-----------------------+-------------------+-------------------+---------+-------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+|2026-05-03 03:37:41.676|7062148845741428783|3153473186116855083|overwrite|s3://warehouse/silver/customers/metadata/snap-7062148845741428783-1-4da80efb-ea2f-4b07-a4bb-94aa3c6647d5.avro|{spark.app.id -> local-1777779448020, added-data-files -> 1, deleted-data-files -> 1, added-records -> 50, deleted-records -> 50, added-files-size -> 4154, removed-files-size -> 4154, changed-partition-count -> 1, total-records -> 50, total-files-size -> 4154, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777779448020, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:34:30.758|3153473186116855083|1507900816926303422|overwrite|s3://warehouse/silver/customers/metadata/snap-3153473186116855083-1-2f5ed416-13fd-477f-9818-d04ebeebf171.avro|{spark.app.id -> local-1777779255347, added-data-files -> 1, deleted-data-files -> 1, added-records -> 50, deleted-records -> 50, added-files-size -> 4154, removed-files-size -> 4154, changed-partition-count -> 1, total-records -> 50, total-files-size -> 4154, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777779255347, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:31:53.292|1507900816926303422|6483451385430272618|overwrite|s3://warehouse/silver/customers/metadata/snap-1507900816926303422-1-2f05b596-b92c-4f41-94a6-f41ba8dd23d8.avro|{spark.app.id -> local-1777779098828, added-data-files -> 1, deleted-data-files -> 1, added-records -> 50, deleted-records -> 50, added-files-size -> 4154, removed-files-size -> 4154, changed-partition-count -> 1, total-records -> 50, total-files-size -> 4154, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777779098828, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:21:42.076|6483451385430272618|7630222710045960844|overwrite|s3://warehouse/silver/customers/metadata/snap-6483451385430272618-1-b5db3b5c-777f-4e47-a506-e68724fb6adf.avro|{spark.app.id -> local-1777778488208, added-data-files -> 1, deleted-data-files -> 1, added-records -> 50, deleted-records -> 51, added-files-size -> 4154, removed-files-size -> 4201, changed-partition-count -> 1, total-records -> 50, total-files-size -> 4154, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777778488208, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:18:09.399|7630222710045960844|7557350134518083260|overwrite|s3://warehouse/silver/customers/metadata/snap-7630222710045960844-1-69fa5273-4d0a-4b5a-aab4-e705f0f07647.avro|{spark.app.id -> local-1777778275604, added-data-files -> 1, deleted-data-files -> 1, added-records -> 51, deleted-records -> 51, added-files-size -> 4201, removed-files-size -> 4201, changed-partition-count -> 1, total-records -> 51, total-files-size -> 4201, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777778275604, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:15:26.395|7557350134518083260|237966960274289942 |overwrite|s3://warehouse/silver/customers/metadata/snap-7557350134518083260-1-f966f78a-4bd2-40ab-a72d-073f2db407b2.avro|{spark.app.id -> local-1777778111900, added-data-files -> 1, deleted-data-files -> 1, added-records -> 51, deleted-records -> 50, added-files-size -> 4201, removed-files-size -> 4154, changed-partition-count -> 1, total-records -> 51, total-files-size -> 4201, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777778111900, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:11:37.118|237966960274289942 |4142675863625265855|overwrite|s3://warehouse/silver/customers/metadata/snap-237966960274289942-1-493ea247-4f98-462d-ae4d-9cca6dc4ac1c.avro |{spark.app.id -> local-1777777880780, added-data-files -> 1, deleted-data-files -> 1, added-records -> 50, deleted-records -> 50, added-files-size -> 4154, removed-files-size -> 4154, changed-partition-count -> 1, total-records -> 50, total-files-size -> 4154, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777777880780, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:08:15.316|4142675863625265855|NULL               |append   |s3://warehouse/silver/customers/metadata/snap-4142675863625265855-1-b28501ed-9fc3-496f-95e9-6595de7f9abd.avro|{spark.app.id -> local-1777777682887, added-data-files -> 1, added-records -> 50, added-files-size -> 4154, changed-partition-count -> 1, total-records -> 50, total-files-size -> 4154, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777777682887, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}                                                                            |
++-----------------------+-------------------+-------------------+---------+-------------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+
+================================================================================
+demo.silver.drivers.snapshots
++-----------------------+-------------------+-------------------+---------+-----------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+|committed_at           |snapshot_id        |parent_id          |operation|manifest_list                                                                                              |summary                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
++-----------------------+-------------------+-------------------+---------+-----------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+|2026-05-03 03:37:43.727|3550984257228844583|7253557141175406055|overwrite|s3://warehouse/silver/drivers/metadata/snap-3550984257228844583-1-971adefb-c50d-4e5d-96af-393946be0da9.avro|{spark.app.id -> local-1777779448020, added-data-files -> 1, deleted-data-files -> 1, added-records -> 28, deleted-records -> 28, added-files-size -> 3926, removed-files-size -> 3926, changed-partition-count -> 1, total-records -> 28, total-files-size -> 3926, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777779448020, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:34:32.697|7253557141175406055|6368384596970471972|overwrite|s3://warehouse/silver/drivers/metadata/snap-7253557141175406055-1-e20e564b-94d0-4195-9cb1-cd6adb0dc257.avro|{spark.app.id -> local-1777779255347, added-data-files -> 1, deleted-data-files -> 1, added-records -> 28, deleted-records -> 28, added-files-size -> 3926, removed-files-size -> 3926, changed-partition-count -> 1, total-records -> 28, total-files-size -> 3926, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777779255347, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:31:54.866|6368384596970471972|8953544307087829835|overwrite|s3://warehouse/silver/drivers/metadata/snap-6368384596970471972-1-cd445f71-ade5-4e0a-81ba-ea7779fe7953.avro|{spark.app.id -> local-1777779098828, added-data-files -> 1, deleted-data-files -> 1, added-records -> 28, deleted-records -> 28, added-files-size -> 3926, removed-files-size -> 3926, changed-partition-count -> 1, total-records -> 28, total-files-size -> 3926, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777779098828, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:21:43.894|8953544307087829835|3749372199225902238|overwrite|s3://warehouse/silver/drivers/metadata/snap-8953544307087829835-1-6f6872c1-6f9f-4586-9ed5-e0e700c62776.avro|{spark.app.id -> local-1777778488208, added-data-files -> 1, deleted-data-files -> 1, added-records -> 28, deleted-records -> 28, added-files-size -> 3926, removed-files-size -> 3926, changed-partition-count -> 1, total-records -> 28, total-files-size -> 3926, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777778488208, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:18:11.148|3749372199225902238|6159003562568102341|overwrite|s3://warehouse/silver/drivers/metadata/snap-3749372199225902238-1-455cdd98-c1e8-4847-9e3f-c38ca3d0b113.avro|{spark.app.id -> local-1777778275604, added-data-files -> 1, deleted-data-files -> 1, added-records -> 28, deleted-records -> 28, added-files-size -> 3926, removed-files-size -> 3926, changed-partition-count -> 1, total-records -> 28, total-files-size -> 3926, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777778275604, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:15:28.461|6159003562568102341|8094084351565846505|overwrite|s3://warehouse/silver/drivers/metadata/snap-6159003562568102341-1-e391a0c5-9647-4f78-ad32-69e548667fb8.avro|{spark.app.id -> local-1777778111900, added-data-files -> 1, deleted-data-files -> 1, added-records -> 28, deleted-records -> 28, added-files-size -> 3926, removed-files-size -> 3926, changed-partition-count -> 1, total-records -> 28, total-files-size -> 3926, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777778111900, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:11:39.536|8094084351565846505|6294093181677771477|overwrite|s3://warehouse/silver/drivers/metadata/snap-8094084351565846505-1-7598e8e9-532d-40c0-b8ea-7ada9c1c7c75.avro|{spark.app.id -> local-1777777880780, added-data-files -> 1, deleted-data-files -> 1, added-records -> 28, deleted-records -> 28, added-files-size -> 3926, removed-files-size -> 3926, changed-partition-count -> 1, total-records -> 28, total-files-size -> 3926, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777777880780, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}|
+|2026-05-03 03:08:16.846|6294093181677771477|NULL               |append   |s3://warehouse/silver/drivers/metadata/snap-6294093181677771477-1-5e12fb82-cbad-4f54-a7c4-d03c3e4fadd6.avro|{spark.app.id -> local-1777777682887, added-data-files -> 1, added-records -> 28, added-files-size -> 3926, changed-partition-count -> 1, total-records -> 28, total-files-size -> 3926, total-data-files -> 1, total-delete-files -> 0, total-position-deletes -> 0, total-equality-deletes -> 0, engine-version -> 4.1.0, app-id -> local-1777777682887, engine-name -> spark, iceberg-version -> Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)}                                                                            |
++-----------------------+-------------------+-------------------+---------+-----------------------------------------------------------------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+---
+
+### Time Travel & Rollback
+
+Time travel query:
+
+```sql
+SELECT COUNT(*) 
+FROM demo.silver.customers VERSION AS OF 4200449033602875954;
+```
+
+Result:
+
+* Old version: 10 rows
+* Current version: 50 rows
+
+Rollback approach:
+
+```sql
+CALL demo.system.rollback_to_snapshot('silver.customers', <snapshot_id>);
+```
+
+This allows reverting to a previous consistent state after a bad MERGE.
+
+---
+
+## 3. Orchestration Design
+
+### DAG Structure
+
+Task flow:
 
 ```
-┌─ Path A: CDC ──────────────────────────────────────────────────┐
-│  PostgreSQL → Debezium → Kafka → Bronze (CDC) → Silver (MERGE) │
-└────────────────────────────────────────────────────────────────┘
+register_connector → connector_health → [bronze_cdc, bronze_taxi]
 
-┌─ Path B: Streaming (from Project 2) ──────────────────────────┐
-│  Taxi producer → Kafka → Bronze (taxi) → Silver → Gold         │
-└────────────────────────────────────────────────────────────────┘
-
-┌─ Airflow DAG orchestrates both paths ─────────────────────────┐
-│  health_check → [bronze_cdc, bronze_taxi] → [silver_cdc,      │
-│  silver_taxi] → gold_taxi → validation                         │
-└────────────────────────────────────────────────────────────────┘
+bronze_cdc → silver_cdc → validate
+bronze_taxi → silver_taxi → gold_taxi
 ```
 
-### Path A — CDC Pipeline (new)
+Explanation:
 
-#### 1. Debezium CDC connector
-
-- Register a Debezium PostgreSQL connector via the Kafka Connect REST API.
-- Configure it to capture changes from the source tables using log-based CDC (WAL).
-- Verify that CDC events appear in Kafka topics (`dbserver1.public.<table>`).
-- Handle the initial snapshot — document which snapshot mode you chose and why.
-
-#### 2. Bronze CDC layer (raw CDC events)
-
-- Read CDC events from Kafka using Spark.
-- Parse the Debezium envelope correctly (extract from `$.payload.*` — the `schema + payload` wrapper).
-- Write all events as-is to a bronze Iceberg table. Append-only — never update or delete rows in bronze.
-- Include Kafka metadata (offset, partition, timestamp) alongside CDC fields (op, before, after, ts_ms).
-- Handle tombstone messages (null-value records from deletes).
-
-#### 3. Silver CDC layer (current-state mirror)
-
-- Read from the bronze CDC table incrementally (only new events since last run).
-- Deduplicate: keep only the latest event per primary key (`ROW_NUMBER` over `ts_ms DESC`).
-- Apply `MERGE INTO` to the silver Iceberg table:
-  - `op = 'd'` → DELETE the row
-  - `op IN ('u', 'c', 'r')` → UPDATE if exists, INSERT if not
-- After MERGE, silver should mirror the current state of the PostgreSQL source.
-- Document your MERGE logic and explain why it is idempotent.
-
-### Path B — Streaming Taxi Pipeline (improved from Project 2)
-
-#### 4. Bronze → Silver → Gold for taxi data
-
-- Same medallion pipeline as Project 2: raw Kafka events → cleaned/enriched → aggregated.
-- Improve upon your Project 2 implementation based on feedback received.
-- **New requirement:** this pipeline must now be triggered by Airflow, not run as a standalone streaming job.
-
-### Orchestration (ties both paths together)
-
-#### 5. Airflow DAG
-
-- Create an Airflow DAG that orchestrates **both pipelines** end-to-end.
-- The DAG should include at minimum:
-  - A **health-check task** to verify the Debezium connector is running (REST API call).
-  - **Bronze ingestion tasks** for both CDC and taxi data.
-  - **Silver tasks** for both pipelines (MERGE for CDC, clean/enrich for taxi).
-  - A **gold task** for the taxi aggregation.
-  - A **validation task** that confirms silver CDC matches PostgreSQL source.
-- **Scheduling:** Configure a reasonable schedule interval. Justify your choice — what freshness SLA does it support?
-- **Retries and failure handling:** Configure task-level retries. If the MERGE task fails, downstream tasks should not run. If the connector health check fails, the DAG should alert and stop.
-- **SLAs:** Set a time limit on the DAG. Configure at least one failure notification mechanism.
-- **Idempotent re-runs:** Running the DAG twice for the same interval must produce the same result. This is critical for backfill scenarios.
-
-### Bonus (not required)
-
-#### 6. Schema evolution
-
-- Add a column to the PostgreSQL source table while the pipeline is running.
-- Show that Debezium detects the change, bronze stores both old and new events, silver evolves via `ALTER TABLE ADD COLUMN`.
+* Connector must be running before ingestion
+* Bronze loads raw data
+* Silver transforms and merges
+* Gold aggregates
+* Validation ensures correctness
 
 ---
 
-## What is graded
+### Scheduling Strategy
 
-Create a report (`REPORT.md`, max ~3 pages). Use the template provided.
+```
+schedule_interval = "*/5 * * * *"
+```
 
-### 1. CDC correctness
-
-- Show that silver mirrors PostgreSQL (compare row counts and spot-check specific rows).
-- Show that deletes in PostgreSQL are reflected in silver.
-- Show that the pipeline is idempotent — running the DAG twice with no new changes produces the same state.
-
-### 2. Lakehouse design
-
-- Describe the schema of bronze CDC, silver CDC, bronze taxi, silver taxi, and gold tables.
-- Show Iceberg snapshot history for the silver CDC table.
-- Explain how you would roll back a bad MERGE using Iceberg time travel.
-
-### 3. Orchestration design
-
-- Include a screenshot of your Airflow DAG (graph view).
-- Explain the task dependency chain and why tasks are in this order.
-- Describe your scheduling strategy and what freshness SLA it supports.
-- Describe retry and failure handling. Show at least one example of a failed task and how the DAG handled it.
-- Show DAG run history — at least 3 successful consecutive runs.
-- Explain how backfill works for your DAG.
-
-### 4. Streaming pipeline (taxi)
-
-- Show that the taxi bronze/silver/gold pipeline works correctly (same criteria as Project 2).
-- Show improvements over Project 2 based on feedback.
-
-### 5. Custom scenario
-
-- Explain and/or show how you solved the custom scenario from the GitHub issue.
+* Runs every 5 minutes
+* Freshness SLA ≈ 5 minutes
+* Avoids Spark job overlap
+* Uses `max_active_runs=1`
 
 ---
 
-## Deliverables
+### Retry and Failure Handling
 
-GitHub repository containing:
+* `retries = 1` configured
+* Failed tasks automatically retried
 
-- **Code:** Spark notebooks or Python scripts, Airflow DAG file(s), connector configuration, seed/simulate scripts. Must run end-to-end.
-- **Report** (`REPORT.md`).
-- The Iceberg tables must be queryable after running the pipeline.
-- The Airflow DAG must be visible and runnable in the Airflow UI.
+Example:
 
-## How it will be checked
-
-The grading process:
-
-1. Clone your repository.
-2. Run `docker compose up`, `seed.py`, `simulate.py`, and `produce.py`.
-3. Trigger the Airflow DAG or wait for the scheduled run.
-4. Verify bronze CDC contains raw CDC events, silver CDC mirrors PostgreSQL.
-5. Verify bronze/silver/gold taxi tables contain correct data.
-6. Stop the simulator, make a manual change in PostgreSQL, trigger the DAG, verify silver reflects the change.
-7. Check Airflow for DAG run history, task logs, and retry behavior.
-8. Manually fail a task (e.g., stop Kafka Connect) and verify the DAG handles it correctly.
-
-**Share your GitHub repository link in Moodle under Module 3 as soon as possible so custom scenarios can be assigned.**
+* Validation failed while simulator was running
+* After stopping simulator, retry succeeded
 
 ---
 
-## Grading checklist (self-review before submission)
+### DAG Run History
 
-- [ ] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors
-- [ ] Debezium connector is registered and RUNNING
-- [ ] Bronze CDC table contains raw Debezium events with correct op, before, after fields
-- [ ] Silver CDC table matches PostgreSQL source (row count + spot check)
-- [ ] Deletes in PostgreSQL are reflected in silver CDC
-- [ ] Running the DAG twice produces the same silver state (idempotent)
-- [ ] Taxi bronze/silver/gold tables are correct (improved from Project 2)
-- [ ] Airflow DAG is visible in the UI with correct task dependencies
-- [ ] At least 3 successful DAG runs shown
-- [ ] Retry/failure handling configured and documented
-- [ ] Iceberg snapshot history shown in REPORT.md
-- [ ] Custom scenario implemented and documented
-- [ ] REPORT.md answers all required sections
-- [ ] `.env` values provided in REPORT.md section 8
+At least three consecutive successful runs were observed in Airflow.
+
+![alt text](image.png)
 
 ---
 
-## Troubleshooting
+### Backfill
 
-**Debezium connector FAILED**
-Check `docker compose logs connect` for errors. Common causes: PostgreSQL not reachable,
-wrong credentials, `wal_level` not set to `logical`, replication slot already exists from
-a previous run.
+Backfill works because:
 
-**CDC events have all NULL fields**
-You are parsing from the top level instead of `$.payload.*`. Debezium wraps events in a
-`{"schema": {...}, "payload": {...}}` envelope. Extract from `$.payload.op`,
-`$.payload.after.id`, etc.
+* Bronze reads Kafka from earliest offsets
+* Silver rebuild is deterministic
+* Re-running DAG reconstructs state correctly
 
-**PostgreSQL replication slot growing**
-If the Debezium connector is stopped for a long time, PostgreSQL retains WAL segments.
-Check with: `SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots;`
+---
 
-**Airflow DAG not appearing**
-Place your DAG `.py` file in the `dags/` directory. The scheduler scans this folder.
-Check `docker compose logs airflow-scheduler` for import errors.
+## 4. Streaming Pipeline (Taxi)
 
-**`Failed to find data source: kafka`**
-Check `PYSPARK_SUBMIT_ARGS` in `compose.yml` — versions must match your Spark version.
+### Verification
 
-**Iceberg table not found after restart**
-Tables are stored in MinIO (persistent named volume). They survive container restarts
-unless you run `docker compose down -v`.
+Taxi pipeline validated by:
+
+* Non-zero row counts in Bronze, Silver, Gold
+* Correct schema and values
+* Aggregations produced expected metrics
+
+[{"id":"ff68c6bc","cell_type":"code","source":"for table in [\n    \"demo.bronze.stg_taxi\",\n    \"demo.silver.fct_taxi_trip\",\n    \"demo.gold.analytical_taxi_trips\",\n    \"demo.gold.taxi_zone_hourly_metrics\",\n]:\n    print(\"\\n\" + \"=\" * 80)\n    print(table)\n    spark.sql(f\"SELECT COUNT(*) AS n FROM {table}\").show()\n    spark.sql(f\"SELECT * FROM {table} LIMIT 5\").show(truncate=False)\n","metadata":{"trusted":true},"outputs":[{"name":"stdout","output_type":"stream","text":"\n================================================================================\ndemo.bronze.stg_taxi\n+---+\n|  n|\n+---+\n|177|\n+---+\n\n+-----------------------+---+------+---------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+\n|kafka_time             |key|offset|partition|value                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |\n+-----------------------+---+------+---------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+\n|2026-05-03 03:10:19.824|1  |0     |0        |{\"VendorID\": 1, \"tpep_pickup_datetime\": \"2025-01-01T00:18:38\", \"tpep_dropoff_datetime\": \"2025-01-01T00:26:59\", \"passenger_count\": 1.0, \"trip_distance\": 1.6, \"RatecodeID\": 1.0, \"store_and_fwd_flag\": \"N\", \"PULocationID\": 229, \"DOLocationID\": 237, \"payment_type\": 1, \"fare_amount\": 10.0, \"extra\": 3.5, \"mta_tax\": 0.5, \"tip_amount\": 3.0, \"tolls_amount\": 0.0, \"improvement_surcharge\": 1.0, \"total_amount\": 18.0, \"congestion_surcharge\": 2.5, \"Airport_fee\": 0.0, \"cbd_congestion_fee\": 0.0} |\n|2026-05-03 03:10:20.062|1  |1     |0        |{\"VendorID\": 1, \"tpep_pickup_datetime\": \"2025-01-01T00:32:40\", \"tpep_dropoff_datetime\": \"2025-01-01T00:35:13\", \"passenger_count\": 1.0, \"trip_distance\": 0.5, \"RatecodeID\": 1.0, \"store_and_fwd_flag\": \"N\", \"PULocationID\": 236, \"DOLocationID\": 237, \"payment_type\": 1, \"fare_amount\": 5.1, \"extra\": 3.5, \"mta_tax\": 0.5, \"tip_amount\": 2.02, \"tolls_amount\": 0.0, \"improvement_surcharge\": 1.0, \"total_amount\": 12.12, \"congestion_surcharge\": 2.5, \"Airport_fee\": 0.0, \"cbd_congestion_fee\": 0.0}|\n|2026-05-03 03:10:20.264|1  |2     |0        |{\"VendorID\": 1, \"tpep_pickup_datetime\": \"2025-01-01T00:44:04\", \"tpep_dropoff_datetime\": \"2025-01-01T00:46:01\", \"passenger_count\": 1.0, \"trip_distance\": 0.6, \"RatecodeID\": 1.0, \"store_and_fwd_flag\": \"N\", \"PULocationID\": 141, \"DOLocationID\": 141, \"payment_type\": 1, \"fare_amount\": 5.1, \"extra\": 3.5, \"mta_tax\": 0.5, \"tip_amount\": 2.0, \"tolls_amount\": 0.0, \"improvement_surcharge\": 1.0, \"total_amount\": 12.1, \"congestion_surcharge\": 2.5, \"Airport_fee\": 0.0, \"cbd_congestion_fee\": 0.0}  |\n|2026-05-03 03:10:20.465|2  |3     |0        |{\"VendorID\": 2, \"tpep_pickup_datetime\": \"2025-01-01T00:14:27\", \"tpep_dropoff_datetime\": \"2025-01-01T00:20:01\", \"passenger_count\": 3.0, \"trip_distance\": 0.52, \"RatecodeID\": 1.0, \"store_and_fwd_flag\": \"N\", \"PULocationID\": 244, \"DOLocationID\": 244, \"payment_type\": 2, \"fare_amount\": 7.2, \"extra\": 1.0, \"mta_tax\": 0.5, \"tip_amount\": 0.0, \"tolls_amount\": 0.0, \"improvement_surcharge\": 1.0, \"total_amount\": 9.7, \"congestion_surcharge\": 0.0, \"Airport_fee\": 0.0, \"cbd_congestion_fee\": 0.0}  |\n|2026-05-03 03:10:20.668|2  |4     |0        |{\"VendorID\": 2, \"tpep_pickup_datetime\": \"2025-01-01T00:21:34\", \"tpep_dropoff_datetime\": \"2025-01-01T00:25:06\", \"passenger_count\": 3.0, \"trip_distance\": 0.66, \"RatecodeID\": 1.0, \"store_and_fwd_flag\": \"N\", \"PULocationID\": 244, \"DOLocationID\": 116, \"payment_type\": 2, \"fare_amount\": 5.8, \"extra\": 1.0, \"mta_tax\": 0.5, \"tip_amount\": 0.0, \"tolls_amount\": 0.0, \"improvement_surcharge\": 1.0, \"total_amount\": 8.3, \"congestion_surcharge\": 0.0, \"Airport_fee\": 0.0, \"cbd_congestion_fee\": 0.0}  |\n+-----------------------+---+------+---------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+\n\n\n================================================================================\ndemo.silver.fct_taxi_trip\n+---+\n|  n|\n+---+\n|172|\n+---+\n\n+----------------------------------------------------------------+--------+----------+------------+------------+--------------------+---------------------+---------------+-------------+------------------+------------+-----------+-----+-------+----------+------------+---------------------+--------------------+-----------+------------------+------------+-------------------------+----------+---------------+---------------------+----------+---------------+\n|tripID                                                          |VendorID|RatecodeID|PULocationID|DOLocationID|tpep_pickup_datetime|tpep_dropoff_datetime|passenger_count|trip_distance|store_and_fwd_flag|payment_type|fare_amount|extra|mta_tax|tip_amount|tolls_amount|improvement_surcharge|congestion_surcharge|Airport_fee|cbd_congestion_fee|total_amount|PU_Zone                  |PU_Borough|PU_service_zone|DO_Zone              |DO_Borough|DO_service_zone|\n+----------------------------------------------------------------+--------+----------+------------+------------+--------------------+---------------------+---------------+-------------+------------------+------------+-----------+-----+-------+----------+------------+---------------------+--------------------+-----------+------------------+------------+-------------------------+----------+---------------+---------------------+----------+---------------+\n|000dcb49cb5ced0ed2de44c36df9b6c4170f0e97048c7073cf60f6b00a1878f7|1       |NULL      |236         |237         |2025-01-01 00:48:55 |2025-01-01 00:56:18  |1              |1.3          |N                 |1           |8.6        |3.5  |0.5    |2.72      |0.0         |1.0                  |2.5                 |0.0        |0.0               |16.32       |Upper East Side North    |Manhattan |Yellow Zone    |Upper East Side South|Manhattan |Yellow Zone    |\n|0262bb05289250e5160c419268f454b91895444f5b5baaa789d9fa226f097032|1       |NULL      |170         |170         |2025-01-01 00:14:47 |2025-01-01 00:16:15  |1              |0.4          |N                 |1           |4.4        |3.5  |0.5    |2.35      |0.0         |1.0                  |2.5                 |0.0        |0.0               |11.75       |Murray Hill              |Manhattan |Yellow Zone    |Murray Hill          |Manhattan |Yellow Zone    |\n|02fb2024e461199ea458991d0864889fe5dc1a0d763de1b58e94ab2c64cbcb34|1       |NULL      |79          |170         |2025-01-01 00:27:34 |2025-01-01 00:33:38  |1              |1.2          |N                 |1           |7.9        |3.5  |0.5    |1.0       |0.0         |1.0                  |2.5                 |0.0        |0.0               |13.9        |East Village             |Manhattan |Yellow Zone    |Murray Hill          |Manhattan |Yellow Zone    |\n|054613cff6872147ebdde1c805114095a852e4c647c947551feb813991ee7604|2       |NULL      |114         |161         |2025-01-01 00:15:41 |2025-01-01 01:03:03  |1              |3.05         |N                 |1           |37.3       |1.0  |0.5    |8.46      |0.0         |1.0                  |2.5                 |0.0        |0.0               |50.76       |Greenwich Village South  |Manhattan |Yellow Zone    |Midtown Center       |Manhattan |Yellow Zone    |\n|0e8e217b079adcf1779034e7523b59316e19821253e6772635702a31fe29ab84|2       |NULL      |246         |170         |2025-01-01 00:34:40 |2025-01-01 00:51:19  |1              |1.19         |N                 |1           |14.9       |1.0  |0.5    |3.98      |0.0         |1.0                  |2.5                 |0.0        |0.0               |23.88       |West Chelsea/Hudson Yards|Manhattan |Yellow Zone    |Murray Hill          |Manhattan |Yellow Zone    |\n+----------------------------------------------------------------+--------+----------+------------+------------+--------------------+---------------------+---------------+-------------+------------------+------------+-----------+-----+-------+----------+------------+---------------------+--------------------+-----------+------------------+------------+-------------------------+----------+---------------+---------------------+----------+---------------+\n\n\n================================================================================\ndemo.gold.analytical_taxi_trips\n+---+\n|  n|\n+---+\n|172|\n+---+\n\n+--------------------+---------------------+-------------------+----------+---------------+------------+---------------------+\n|tpep_pickup_datetime|tpep_dropoff_datetime|PU_Zone            |PU_Borough|PU_service_zone|total_amount|trip_duration_minutes|\n+--------------------+---------------------+-------------------+----------+---------------+------------+---------------------+\n|2025-01-01 00:21:57 |2025-01-01 00:36:23  |Central Park       |Manhattan |Yellow Zone    |19.2        |14                   |\n|2025-01-01 00:47:58 |2025-01-01 00:59:47  |Union Sq           |Manhattan |Yellow Zone    |18.81       |12                   |\n|2025-01-01 00:11:27 |2025-01-01 00:16:58  |Little Italy/NoLiTa|Manhattan |Yellow Zone    |12.2        |6                    |\n|2025-01-01 00:15:20 |2025-01-01 00:32:29  |Union Sq           |Manhattan |Yellow Zone    |27.72       |17                   |\n|2025-01-01 00:51:59 |2025-01-01 01:16:41  |Union Sq           |Manhattan |Yellow Zone    |31.2        |25                   |\n+--------------------+---------------------+-------------------+----------+---------------+------------+---------------------+\n\n\n================================================================================\ndemo.gold.taxi_zone_hourly_metrics\n+---+\n|  n|\n+---+\n| 48|\n+---+\n\n+-----------+-------------------+-------------------------+----------+----------+----------------+-------------------------+---------------------+\n|pickup_date|pickup_hour        |PU_Zone                  |PU_Borough|trip_count|avg_total_amount|avg_trip_duration_minutes|avg_amount_per_minute|\n+-----------+-------------------+-------------------------+----------+----------+----------------+-------------------------+---------------------+\n|2025-01-01 |2025-01-01 00:00:00|Union Sq                 |Manhattan |5         |21.9            |14.2                     |1.71                 |\n|2025-01-01 |2025-01-01 00:00:00|Lincoln Square East      |Manhattan |10        |22.73           |13.9                     |1.88                 |\n|2025-01-01 |2025-01-01 00:00:00|West Chelsea/Hudson Yards|Manhattan |4         |26.91           |19.75                    |1.38                 |\n|2025-01-01 |2025-01-01 00:00:00|Flatiron                 |Manhattan |2         |53.49           |31.0                     |1.88                 |\n|2025-01-01 |2025-01-01 00:00:00|Upper West Side North    |Manhattan |4         |18.63           |10.5                     |1.78                 |\n+-----------+-------------------+-------------------------+----------+----------+----------------+-------------------------+---------------------+\n\n"}],"execution_count":21}]
+
+### Improvements over Project 2
+
+* Airflow orchestration added
+* Gold aggregation introduced
+* Deterministic rebuild from Bronze
+* Continuous ingestion via Kafka
+
+---
+
+## 5. Custom Scenario
+
+Did not have custom scenario.
+
+---
+
+## 6. Bonus
+
+Did not do bonus task.
+
+---
+
+## Conclusion
+
+The pipeline successfully implements:
+
+* End-to-end CDC ingestion
+* Lakehouse architecture with Iceberg
+* Reliable orchestration via Airflow
+* Streaming taxi analytics

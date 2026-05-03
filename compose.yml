@@ -134,6 +134,7 @@ services:
   airflow:
     image: apache/airflow:2.10.5-python3.11
     container_name: airflow
+    user: root
     depends_on:
       kafka:
         condition: service_healthy
@@ -149,29 +150,48 @@ services:
       - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
       - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=True
-      # Pass connection info so DAGs can reach other services
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      - AIRFLOW_CONN_CONNECT=http://connect:8083
       - KAFKA_BOOTSTRAP=kafka:9092
       - CONNECT_URL=http://connect:8083
       - PG_HOST=postgres
       - PG_PORT=5432
       - PG_DB=sourcedb
       - PG_USER=${PG_USER:-cdc_user}
-      - PG_PASSWORD=${PG_PASSWORD:-cdc_pass}
+      - PG_PASSWORD=${PG_PASSWORD:-admin}
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - AWS_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+      - PYSPARK_SUBMIT_ARGS=--packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.0,org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0,org.apache.iceberg:iceberg-aws-bundle:1.10.0 pyspark-shell
     volumes:
       - ./dags:/opt/airflow/dags
       - airflow-data:/opt/airflow
-    entrypoint: >
-      /bin/bash -c "
-        airflow db migrate;
-        airflow users create
-          --username ${AIRFLOW_USER:-admin}
-          --password ${AIRFLOW_PASSWORD:-admin}
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email admin@example.com 2>/dev/null || true;
-        exec airflow standalone
-      "
+      - ./:/home/jovyan/project
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        apt-get update
+        apt-get install -y --no-install-recommends openjdk-17-jdk
+        su airflow -c "/home/airflow/.local/bin/pip install --no-cache-dir pyspark==4.1.0 psycopg2-binary kafka-python apache-airflow-providers-http"
+
+        chown -R airflow:root /opt/airflow /home/jovyan/project
+
+        su airflow -c "airflow db migrate"
+
+        su airflow -c "airflow users create \
+          --username ${AIRFLOW_USER:-admin} \
+          --password ${AIRFLOW_PASSWORD:-admin} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com" || true
+
+        su airflow -c "airflow scheduler" &
+
+        exec su airflow -c "airflow webserver"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
       interval: 15s
@@ -205,11 +225,12 @@ services:
       - CONNECT_URL=http://connect:8083
       - PYSPARK_SUBMIT_ARGS=--packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.0,org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0,org.apache.iceberg:iceberg-aws-bundle:1.10.0 pyspark-shell
     command: >
+      bash -c "pip install psycopg2-binary kafka-python &&
       start-notebook.py
       --ServerApp.token=${JUPYTER_TOKEN}
       --ServerApp.password=''
       --ServerApp.allow_origin='*'
-      --ServerApp.allow_remote_access=True
+      --ServerApp.allow_remote_access=True"
 
 volumes:
   pg-data:
