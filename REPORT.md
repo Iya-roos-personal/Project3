@@ -2,6 +2,10 @@
 
 .env values are the same as .env.example (just to simplfy running project).
 
+Used jupyter notebook project3.ipynb for testing things and most pictures are taken from there.
+
+Starting Airflow might take some time since it installs pyspark.
+
 ## 1. CDC Correctness
 
 ### Silver Mirrors PostgreSQL
